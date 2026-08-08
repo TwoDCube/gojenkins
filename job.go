@@ -120,13 +120,46 @@ func (j *Job) GetDetails() *JobResponse {
 	return j.Raw
 }
 
-func (j *Job) GetBuild(ctx context.Context, id int64) (*Build, error) {
+// jobURLPath converts the absolute URL Jenkins reports for a job into the
+// server-relative endpoint path used for requests (e.g. "/job/folder/job/name").
+//
+// Jenkins advertises job URLs under its configured root URL, which does not
+// have to match the URL this client connects through: reverse proxies,
+// SSH/ktunnel-style tunnels, and split-horizon DNS all present the server
+// under a different host. Stripping the client's server URL as a string
+// prefix (the historical behavior) silently returns the absolute foreign URL
+// in those cases, and the requester then mangles it into
+// "<server><foreign-url>/...". Extracting the URL's path instead keeps every
+// request on the connection URL no matter what host Jenkins advertises.
+//
+// A server URL carrying a path prefix (e.g. https://host/jenkins) still
+// works: the requester prepends that prefix to every endpoint, so it is
+// trimmed from the job path here to avoid doubling it.
+//
+// jobURL is the absolute job URL as reported by the server (Raw.URL);
+// serverURL is the client's connection URL (Jenkins.Server, no trailing
+// slash). An unparseable jobURL falls back to the historical prefix-strip so
+// behavior is unchanged for inputs the old code handled.
+func jobURLPath(jobURL, serverURL string) string {
+	u, err := url.Parse(jobURL)
+	if err != nil {
+		return strings.Replace(jobURL, serverURL, "", -1)
+	}
+	p := u.Path
+	if s, err := url.Parse(serverURL); err == nil {
+		if prefix := strings.TrimSuffix(s.Path, "/"); prefix != "" {
+			p = strings.TrimPrefix(p, prefix)
+		}
+	}
+	p = strings.TrimSuffix(p, "/")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
 
-	// Support customized server URL,
-	// i.e. Server : https://<domain>/jenkins/job/JOB1
-	// "https://<domain>/jenkins/" is the server URL,
-	// we are expecting jobURL = "job/JOB1"
-	jobURL := strings.Replace(j.Raw.URL, j.Jenkins.Server, "", -1)
+func (j *Job) GetBuild(ctx context.Context, id int64) (*Build, error) {
+	jobURL := jobURLPath(j.Raw.URL, j.Jenkins.Server)
 	build := Build{Jenkins: j.Jenkins, Job: j, Raw: new(BuildResponse), Depth: 1, Base: jobURL + "/" + strconv.FormatInt(id, 10)}
 	status, err := build.Poll(ctx)
 	if err != nil {
