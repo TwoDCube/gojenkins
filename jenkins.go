@@ -279,6 +279,13 @@ func (j *Jenkins) BuildJob(ctx context.Context, name string, params map[string]s
 
 // A task in queue will be assigned a build number in a job after a few seconds.
 // this function will return the build object.
+//
+// GetBuildFromQueueID blocks (polling once per second) until the queued build
+// starts, the context is cancelled, or Jenkins reports an error for the queue
+// item. Jenkins deletes queue items a few minutes after the build leaves the
+// queue; polling such an item surfaces a *StatusError with StatusCode 404.
+// Callers that poll on their own schedule should use TryGetBuildFromQueueID
+// instead.
 func (j *Jenkins) GetBuildFromQueueID(ctx context.Context, job *Job, queueid int64) (*Build, error) {
 	task, err := j.GetQueueItem(ctx, queueid)
 	if err != nil {
@@ -286,7 +293,11 @@ func (j *Jenkins) GetBuildFromQueueID(ctx context.Context, job *Job, queueid int
 	}
 	// Jenkins queue API has about 4.7second quiet period
 	for task.Raw.Executable.Number == 0 {
-		time.Sleep(1000 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(1000 * time.Millisecond):
+		}
 		_, err = task.Poll(ctx)
 		if err != nil {
 			return nil, err
@@ -298,6 +309,23 @@ func (j *Jenkins) GetBuildFromQueueID(ctx context.Context, job *Job, queueid int
 		return nil, err
 	}
 	return build, nil
+}
+
+// TryGetBuildFromQueueID is the non-blocking variant of GetBuildFromQueueID:
+// it checks the queue item exactly once and returns (nil, nil) when the queued
+// build has not started yet. A queue item Jenkins has already deleted (they
+// are garbage-collected a few minutes after the build leaves the queue)
+// surfaces as a *StatusError with StatusCode 404; Job.FindBuildByQueueID can
+// then be used to recover the build from the job's history.
+func (j *Jenkins) TryGetBuildFromQueueID(ctx context.Context, job *Job, queueid int64) (*Build, error) {
+	task, err := j.GetQueueItem(ctx, queueid)
+	if err != nil {
+		return nil, err
+	}
+	if task.Raw.Executable.Number == 0 {
+		return nil, nil
+	}
+	return job.GetBuild(ctx, task.Raw.Executable.Number)
 }
 
 func (j *Jenkins) GetNode(ctx context.Context, name string) (*Node, error) {

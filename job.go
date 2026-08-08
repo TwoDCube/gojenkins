@@ -138,6 +138,34 @@ func (j *Job) GetBuild(ctx context.Context, id int64) (*Build, error) {
 	return nil, errors.New(strconv.Itoa(status))
 }
 
+// FindBuildByQueueID scans the job's most recent builds for the one created
+// from the given queue item and returns it, or (nil, nil) when none of the
+// examined builds match. limit bounds how many recent builds are examined; a
+// non-positive limit defaults to 50. This is the only way to map a queue ID to
+// its build after Jenkins has deleted the queue item, which happens a few
+// minutes after the build leaves the queue.
+func (j *Job) FindBuildByQueueID(ctx context.Context, queueID int64, limit int) (*Build, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var response struct {
+		Builds []struct {
+			Number  int64 `json:"number"`
+			QueueID int64 `json:"queueId"`
+		} `json:"builds"`
+	}
+	query := map[string]string{"tree": fmt.Sprintf("builds[number,queueId]{0,%d}", limit)}
+	if _, err := j.Jenkins.Requester.GetJSON(ctx, j.Base, &response, query); err != nil {
+		return nil, err
+	}
+	for _, b := range response.Builds {
+		if b.QueueID == queueID {
+			return j.GetBuild(ctx, b.Number)
+		}
+	}
+	return nil, nil
+}
+
 func (j *Job) getBuildByType(ctx context.Context, buildType string) (*Build, error) {
 	allowed := map[string]JobBuild{
 		"lastStableBuild":     j.Raw.LastStableBuild,

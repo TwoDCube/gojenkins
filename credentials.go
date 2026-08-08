@@ -3,6 +3,7 @@ package gojenkins
 import (
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -172,6 +173,14 @@ func (cm CredentialsManager) postCredsXML(ctx context.Context, url string, creds
 }
 
 func (cm CredentialsManager) handleResponse(resp *http.Response, err error) error {
+	// A 409 now arrives as a *StatusError from Requester.Do; keep translating
+	// it to the historical "already exists" message so callers relying on it
+	// are unaffected.
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == 409 {
+		return fmt.Errorf("Resource already exists, conflict status returned")
+	}
+
 	if err != nil {
 		return err
 	}

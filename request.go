@@ -62,9 +62,33 @@ type Requester struct {
 	SslVerify bool
 }
 
+// StatusError is returned by Do when Jenkins responds with an HTTP error
+// status (>= 400). It carries the status code so callers that tolerate
+// specific statuses (e.g. 404 for a garbage-collected queue item) can detect
+// them with errors.As instead of parsing error strings.
+type StatusError struct {
+	// StatusCode is the HTTP status code Jenkins responded with.
+	StatusCode int
+	// Method is the HTTP method of the failed request.
+	Method string
+	// URL is the full URL of the failed request.
+	URL string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("jenkins responded with status %d for %s %s", e.StatusCode, e.Method, e.URL)
+}
+
 func (r *Requester) SetCrumb(ctx context.Context, ar *APIRequest) error {
 	crumbData := map[string]string{}
-	response, _ := r.GetJSON(ctx, "/crumbIssuer/api/json", &crumbData, nil)
+	response, err := r.GetJSON(ctx, "/crumbIssuer/api/json", &crumbData, nil)
+	// The crumb issuer is optional: Jenkins responds 404 when CSRF protection
+	// is disabled. Any failure here (including transport errors) is treated as
+	// "no crumb available" and the request proceeds without one — if Jenkins is
+	// truly unreachable the request being crumbed will fail with a clearer error.
+	if err != nil || response == nil {
+		return nil
+	}
 
 	if response.StatusCode == 200 && crumbData["crumbRequestField"] != "" {
 		ar.SetHeader(crumbData["crumbRequestField"], crumbData["crumb"])
@@ -241,6 +265,16 @@ func (r *Requester) Do(ctx context.Context, ar *APIRequest, responseStruct inter
 		if errorText != "" {
 			return nil, errors.New(errorText)
 		}
+		if response.StatusCode >= 400 {
+			// Drain and close the body so the connection can be reused, then
+			// surface the status as a typed error. The response is returned
+			// alongside the error so callers that ignore the error and inspect
+			// StatusCode directly (a long-standing pattern in this library)
+			// keep working.
+			io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			return response, &StatusError{StatusCode: response.StatusCode, Method: ar.Method, URL: URL.String()}
+		}
 		switch responseStruct.(type) {
 		case *string:
 			return r.ReadRawResponse(response, responseStruct)
@@ -268,9 +302,22 @@ func (r *Requester) ReadRawResponse(response *http.Response, responseStruct inte
 	return response, nil
 }
 
+// ReadJSONResponse decodes the response body into responseStruct. An empty
+// body is not an error: several Jenkins POST endpoints (e.g. build triggers)
+// respond with 200/201 and no content. A body that is present but is not
+// valid JSON (e.g. an HTML error page) is reported as an error instead of
+// leaving responseStruct silently zero-valued. A nil responseStruct skips
+// decoding entirely.
 func (r *Requester) ReadJSONResponse(response *http.Response, responseStruct interface{}) (*http.Response, error) {
 	defer response.Body.Close()
 
-	json.NewDecoder(response.Body).Decode(responseStruct)
+	if responseStruct == nil {
+		io.Copy(io.Discard, response.Body)
+		return response, nil
+	}
+
+	if err := json.NewDecoder(response.Body).Decode(responseStruct); err != nil && err != io.EOF {
+		return response, fmt.Errorf("failed to decode Jenkins response as JSON: %w", err)
+	}
 	return response, nil
 }
